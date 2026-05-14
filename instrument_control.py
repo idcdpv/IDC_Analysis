@@ -9,48 +9,64 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from queue import Queue
 
-# --- Pre-Submersion Setup ---
-devices = [{"host": "raspberrypi.local", "user": "pi", "pass": "password", "folders": ["Cam_1", "Cam_2"]},
-           {"host": "raspberrypi2.local", "user": "pi", "pass": "password", "folders": ["Cam_3", "Cam_4"]}]
+
+# --- 1. Configuration & Mapping ---
+devices = [
+    {"host": "raspberrypi.local",  "user": "pi", "pass": "password", "folders": ["Cam_1", "Cam_2"]},
+    {"host": "raspberrypi2.local", "user": "pi", "pass": "password", "folders": ["Cam_3", "Cam_4"]}
+]
+
+mapping = {
+    "COM4": {"pi": devices[0], "SMU1": 0, "SMU2": 1},
+    "COM5": {"pi": devices[1], "SMU1": 0, "SMU2": 1}
+}
 
 source_meter_names = ["COM4", "COM5"]
-data_csv_path = "IDCSubmersion.csv"
 
+
+# --- 2. Setup & Input ---
 try:
-    data = pd.read_csv(data_csv_path)
     board_id = str(input("Enter the board ID: "))
-    submersion = data[data["board_id"] == board_id]
-
-    if submersion.empty:
-        raise ValueError("Board ID not found in CSV.")
-
-    # --- New Interactive Voltage Prompt ---
     while True:
         try:
             voltage = float(input("Enter the voltage for the SMU (0 to 5V): "))
             if 0.0 <= voltage <= 5.0:
-                break # Valid voltage entered, exit the loop
-            else:
-                print("Error: Voltage must be strictly between 0 and 5V. Try again.")
+                break
+            print("Error: Voltage must be between 0 and 5V.")
         except ValueError:
-            print("Error: Invalid format. Please enter a numerical value (e.g., 3.3).")
+            print("Error: Invalid numerical value.")
+
+    while True:
+        try:
+            timelapse_ms = int(input("Enter image capture interval in milliseconds (e.g. 1000 = 1/sec): "))
+            if timelapse_ms > 0:
+                break
+            print("Error: Interval must be a positive integer.")
+        except ValueError:
+            print("Error: Invalid integer value.")
 
 except Exception as e:
     print(f"Setup Error: {e}")
     exit()
 
-# --- Camera Control ---
-def start_remote_cameras(device, board_id):
+
+
+# --- 3. Remote Control Functions ---
+def start_remote_cameras(device, board_id, timelapse_ms):
     f1, f2 = device["folders"]
     s_idx1, s_idx2 = (3, 4) if "2" in device["host"] else (1, 2)
-    
-    # Naming: boardId_sensorNumber_seconds_date
-    cmd = (f"mkdir -p /home/pi/{f1} /home/pi/{f2} && sleep 1 && "
-       f"nohup /usr/bin/rpicam-still --camera 0 -t 0 --timelapse 1000 -n "
-       f"-o /home/pi/{f1}/{board_id}_U{s_idx1}_$(date +%Y%m%d)_timeseries_%05d.jpg > /home/pi/cam0_debug.txt 2>&1 & "
-       f"nohup /usr/bin/rpicam-still --camera 1 -t 0 --timelapse 1000 -n "
-       f"-o /home/pi/{f2}/{board_id}_U{s_idx2}_$(date +%Y%m%d)_timeseries_%05d.jpg > /home/pi/cam1_debug.txt 2>&1 & "
-       f"disown -a")
+    today = date.today().strftime("%Y%m%d")
+
+    cmd = (
+        f"mkdir -p /home/pi/{f1} /home/pi/{f2} && sleep 1 && "
+        f"nohup /usr/bin/rpicam-still --camera 0 -t 0 --timelapse {timelapse_ms} -n "
+        f"-o '/home/pi/{f1}/{board_id}_U{s_idx1}_{today}_timeseries_%05d.jpg' "
+        f"> /home/pi/cam0_debug.txt 2>&1 & "
+        f"nohup /usr/bin/rpicam-still --camera 1 -t 0 --timelapse {timelapse_ms} -n "
+        f"-o '/home/pi/{f2}/{board_id}_U{s_idx2}_{today}_timeseries_%05d.jpg' "
+        f"> /home/pi/cam1_debug.txt 2>&1 & "
+        f"disown -a"
+    )
 
     try:
         client = paramiko.SSHClient()
@@ -58,20 +74,34 @@ def start_remote_cameras(device, board_id):
         client.connect(device["host"], username=device["user"], password=device["pass"])
         client.exec_command(cmd)
         client.close()
+        print(f"[PI] Cameras started on {device['host']} ({timelapse_ms}ms interval)")
     except Exception as e:
-        print(f"SSH Error on {device['host']}: {e}")
+        print(f"SSH Start Error on {device['host']}: {e}")
 
-def stop_remote_cameras(device):
+def stop_specific_camera(pi_device, cam_index):
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(pi_device["host"], username=pi_device["user"], password=pi_device["pass"])
+        client.exec_command(f"pkill -f 'rpicam-still --camera {cam_index}'")
+        client.close()
+        print(f"  [PI] Stopped camera {cam_index} on {pi_device['host']}")
+    except Exception as e:
+        print(f"  [PI ERROR] Could not stop camera {cam_index}: {e}")
+
+def stop_all_cameras(device):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(device["host"], username=device["user"], password=device["pass"])
-        client.exec_command("pkill rpicam-still")
+        client.exec_command("pkill -f rpicam-still")
         client.close()
-    except: pass
+        print(f"[PI] All cameras stopped on {device['host']}")
+    except Exception as e:
+        print(f"[PI ERROR] Could not stop cameras on {device['host']}: {e}")
 
-
-# instrument thread
+# --- 4. Instrument Thread ---
 def instrument_thread(device_name, data_queue, volt, stop_event):
     pi_info = mapping[device_name]["pi"]
     failed_chans = set()
@@ -123,35 +153,40 @@ def instrument_thread(device_name, data_queue, volt, stop_event):
     except Exception as e:
         print(f"Thread Error on {device_name}: {e}")
 
-# --- Execution ---
+# --- 5. Execution & Plotting ---
 stop_event = threading.Event()
 data_queue = Queue()
 source_meter_data = []
 
 for d in devices:
-    threading.Thread(target=start_remote_cameras, args=(d, board_id)).start()
+    threading.Thread(
+        target=start_remote_cameras,
+        args=(d, board_id, timelapse_ms),
+        daemon=True
+    ).start()
 
 instrument_threads = []
 for dev_name in source_meter_names:
-    t=threading.Thread(target=instrument_thread, args=(dev_name, data_queue, voltage, stop_event), daemon=True)
+    t = threading.Thread(
+        target=instrument_thread,
+        args=(dev_name, data_queue, voltage, stop_event),
+        daemon=True
+    )
     t.start()
     instrument_threads.append(t)
 
-# --- Plotting & Real-time UI ---
+# Plotting setup
 fig, axs = plt.subplots(2, 2, figsize=(10, 8), sharex=True)
 fig.suptitle(f"Real-time Monitoring: Board {board_id}")
 ax_list = axs.flatten()
-lines = []
-data_bins = [([], []) for _ in range(4)] 
+lines = [ax.plot([], [], 'b-')[0] for ax in ax_list]
+data_bins = [([], []) for _ in range(4)]
 
+sensor_labels = ["COM4 SMU1 (U1)", "COM4 SMU2 (U2)", "COM5 SMU1 (U3)", "COM5 SMU2 (U4)"]
 for i, ax in enumerate(ax_list):
-    line, = ax.plot([], [], 'b-')
-    lines.append(line)
-    ax.set_title(f"Sensor {i+1}")
+    ax.set_title(sensor_labels[i])
     ax.set_ylabel("Current (A)")
-    # This sets a window of +/- 50 microamps
-    #ax.set_ylim(-0.001, 0.001)
-
+    ax.set_xlabel("Time (s)")
     ax.grid(True)
 
 def update_plot(frame):
@@ -176,39 +211,40 @@ def update_plot(frame):
             ax_list[i].autoscale_view()
     return lines
 
+def on_close(event):
+    print("\nWindow closed — hard stopping all SMUs and cameras...")
+    stop_event.set()
+
+fig.canvas.mpl_connect('close_event', on_close)
 ani = FuncAnimation(fig, update_plot, interval=500, cache_frame_data=False)
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show() 
+plt.show()
 
-# --- Final Cleanup ---
-print("\nShutting down...")
-stop_event.set()
-
+# --- 6. Final Cleanup ---
 for t in instrument_threads:
-    t.join(timeout=3.0)
+    t.join(timeout=5)
 
-def shutdown_smu(device_name, thread):
-    if thread.is_alive():
-        print(f"Thread for {device_name} still running, forcing SMU shutdown...")
-        try:
-            with xtralien.Device(device_name) as device:
-                device.smu1.set.enabled(False)
-                device.smu2.set.enabled(False)
-                print(f"SMUs disabled on {device_name}")
-        except Exception as e:
-            print(f"Could not disable SMUs on {device_name}: {e}")
-    else:
-        print(f"SMUs on {device_name} shut down cleanly.")
+# Drain any remaining data from the queue before saving
+print("Finalizing data collection...")
+while not data_queue.empty():
+    source_meter_data.append(data_queue.get())
 
-for dev_name, thread in zip(source_meter_names, instrument_threads):
-    shutdown_smu(dev_name, thread)
-
+# Stop all cameras and wait for SSH commands to complete
+camera_stop_threads = []
 for d in devices:
-    stop_remote_cameras(d)
+    t = threading.Thread(target=stop_all_cameras, args=(d,), daemon=True)
+    t.start()
+    camera_stop_threads.append(t)
+
+for t in camera_stop_threads:
+    t.join(timeout=3)
 
 if source_meter_data:
-    current_date=date.today().strftime("%Y%m%d")
+    current_date = date.today().strftime("%Y%m%d")
     filename = f"{board_id}_{current_date}_electricaldata.csv"
-    file_path = os.path.join(r"C:\Users\ja917984\Documents\Automated_IDC_Analysis\electrical_data", filename)
-    pd.DataFrame(source_meter_data).to_csv(file_path, index=False)
-    print(f"Electrical data saved to {filename}")
+    save_path = os.path.join(
+        r"C:\Users\ja917984\Documents\Automated_IDC_Analysis\electrical_data",
+        filename
+    )
+    pd.DataFrame(source_meter_data).to_csv(save_path, index=False)
+    print(f"Data saved to {filename}")
